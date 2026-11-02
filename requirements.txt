@@ -1,0 +1,5 @@
+torch>=2.2.0
+transformers
+triton
+xxhash
+safetensors

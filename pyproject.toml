@@ -1,0 +1,14 @@
+[project]
+name = "local-vllm"
+version = "0.1.0"
+description = "Custom LLM inference engine optimized for GTX 1650 (sm_75)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.2.0",
+    "transformers",
+    "triton",
+    "xxhash",
+    "safetensors",
+]
+
