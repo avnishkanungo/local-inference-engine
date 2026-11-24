@@ -1,9 +1,11 @@
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 import math
+import struct
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
+import xxhash
 
 
 @dataclass
@@ -43,11 +45,17 @@ class BlockSpaceManager:
         Logical_Token_Index -> (Physical_Block_Index, Block_Offset)
     """
 
-    def __init__(self, num_blocks: int = 100, block_size: int = 16) -> None:
+    def __init__(
+        self,
+        num_blocks: int = 100,
+        block_size: int = 16,
+        enable_prefix_caching: bool = False,
+    ) -> None:
         assert num_blocks > 0, "num_blocks must be positive"
         assert block_size > 0, "block_size must be positive"
         self.num_blocks = num_blocks
         self.block_size = block_size
+        self.enable_prefix_caching = enable_prefix_caching
 
         # Physical block pool: indexed 0 .. num_blocks - 1
         self.blocks: List[PhysicalBlock] = [
@@ -60,6 +68,22 @@ class BlockSpaceManager:
         self.page_tables: Dict[int, List[int]] = {}
         # Sequence token lengths: seq_id -> total logical tokens currently stored
         self.seq_num_tokens: Dict[int, int] = {}
+
+        # Phase 5 Prefix Caching state (xxhash chained 64-bit digest -> physical_block_id)
+        self.hash_to_block_id: Dict[int, int] = {}
+        self.prefix_cache_hits: int = 0
+        self.prefix_cache_misses: int = 0
+
+    @staticmethod
+    def compute_block_hash(parent_hash: int, token_ids: Sequence[int]) -> int:
+        """
+        Computes a chained 64-bit xxhash digest for a full block of token IDs.
+        Chaining `parent_hash` binds the block to its entire preceding prefix (vLLM APC style).
+        """
+        h = xxhash.xxh64()
+        h.update(struct.pack("<Q", parent_hash & 0xFFFFFFFFFFFFFFFF))
+        h.update(struct.pack(f"<{len(token_ids)}I", *token_ids))
+        return h.intdigest()
 
     @property
     def num_free_blocks(self) -> int:
@@ -74,6 +98,9 @@ class BlockSpaceManager:
             raise MemoryError("Out of physical KV cache blocks in BlockSpaceManager!")
         block_id = self.free_block_ids.popleft()
         block = self.blocks[block_id]
+        # If this recycled block previously held a cached prefix hash, invalidate that old hash entry
+        if block.block_hash is not None and self.hash_to_block_id.get(block.block_hash) == block_id:
+            del self.hash_to_block_id[block.block_hash]
         block.ref_count = 1
         block.token_ids = []
         block.block_hash = None
@@ -84,8 +111,82 @@ class BlockSpaceManager:
         assert block.ref_count > 0, f"Double free detected on physical block {block_id}"
         block.ref_count -= 1
         if block.ref_count == 0:
-            block.reset()
-            self.free_block_ids.append(block_id)
+            if self.enable_prefix_caching and block.block_hash is not None:
+                # Keep block_hash and token_ids intact so future requests can reclaim it
+                # from the tail of free_block_ids before it gets overwritten!
+                self.free_block_ids.append(block_id)
+            else:
+                block.reset()
+                self.free_block_ids.append(block_id)
+
+    def allocate_with_prefix_cache(
+        self, seq_id: int, token_ids: Sequence[int]
+    ) -> Tuple[List[int], int]:
+        """
+        Phase 5 Prefix-Caching Allocator using chained `xxhash` block digests.
+        Reuses existing physical blocks for full prefix blocks that match in `hash_to_block_id`.
+        Always leaves at least 1 token uncached at the end of the prompt so the forward pass
+        produces next-token logits.
+
+        Returns (assigned_physical_blocks, num_cached_tokens).
+        """
+        if seq_id in self.page_tables:
+            raise ValueError(f"Sequence {seq_id} is already allocated in page_tables.")
+
+        num_tokens = len(token_ids)
+        needed_blocks = math.ceil(num_tokens / self.block_size)
+        assigned_blocks: List[int] = []
+        num_cached_tokens = 0
+        parent_hash = 0
+        prefix_matching_active = self.enable_prefix_caching
+
+        for logical_block_idx in range(needed_blocks):
+            start = logical_block_idx * self.block_size
+            end = min(start + self.block_size, num_tokens)
+            chunk = list(token_ids[start:end])
+            is_full_block = len(chunk) == self.block_size
+            # Leave at least 1 token at the tail of the prompt to compute logits
+            can_skip_compute = end < num_tokens
+
+            block_hash = (
+                self.compute_block_hash(parent_hash, chunk) if is_full_block else None
+            )
+
+            if (
+                prefix_matching_active
+                and is_full_block
+                and can_skip_compute
+                and block_hash in self.hash_to_block_id
+            ):
+                cached_block_id = self.hash_to_block_id[block_hash]
+                cached_block = self.blocks[cached_block_id]
+                if cached_block.token_ids == chunk:
+                    if cached_block.ref_count == 0:
+                        # Reclaim from free_block_ids before it gets overwritten
+                        self.free_block_ids.remove(cached_block_id)
+                    cached_block.ref_count += 1
+                    assigned_blocks.append(cached_block_id)
+                    num_cached_tokens += self.block_size
+                    parent_hash = block_hash
+                    self.prefix_cache_hits += 1
+                    continue
+
+            # Cache miss (or tail block): allocate a fresh physical block
+            prefix_matching_active = False
+            if is_full_block:
+                self.prefix_cache_misses += 1
+
+            block = self._allocate_physical_block()
+            block.token_ids.extend(chunk)
+            if self.enable_prefix_caching and is_full_block and block_hash is not None:
+                block.block_hash = block_hash
+                self.hash_to_block_id[block_hash] = block.block_id
+                parent_hash = block_hash
+            assigned_blocks.append(block.block_id)
+
+        self.page_tables[seq_id] = assigned_blocks
+        self.seq_num_tokens[seq_id] = num_tokens
+        return list(assigned_blocks), num_cached_tokens
 
     def can_allocate(self, num_tokens: int) -> bool:
         """Returns True if enough free physical blocks exist to store `num_tokens`."""
