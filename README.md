@@ -58,7 +58,7 @@ To understand why systems like **vLLM** and **SGLang** exist, we must first unde
 When a user sends a prompt of $N = 512$ tokens, all 512 tokens are known at once.
 * Every Linear layer (`q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, `down_proj`) performs a **Matrix-Matrix Multiplication (GEMM)**:
   $$[512, D_{\text{in}}] \times [D_{\text{in}}, D_{\text{out}}]$$
-* The GPU loads the weight matrix $[D_{\text{in}}, D_{\text{out}}]$ from global VRAM **once** and reuses it across all 512 tokens inside its Tensor Cores.
+* The GPU loads the weight matrix of shape $[D_{\text{in}}]$ by $[D_{\text{out}}]$ from global VRAM **once** and reuses it across all 512 tokens inside its Tensor Cores.
 * **Arithmetic Intensity** (FLOPs per byte read from VRAM) is high. Prefill is **compute-bound**; skipping redundant tokens (via **Phase 5 Prefix Caching**) directly saves massive matrix-multiply FLOPs.
 
 ### Regime B: The Decode Stage (Memory-Bandwidth-Bound & Launch-Overhead-Bound)
@@ -108,9 +108,9 @@ return self.weight * x_normed.to(input_dtype)
 **Why?** In `float16`, the maximum representable number is `65,504`. Squaring hidden activations ($x_i^2$) and summing across $D = 896$ dimensions in `float16` easily overflows to `inf`, producing `NaN` outputs. Upcasting the reduction to `float32` makes our `RMSNorm` **bitwise identical (`max_diff = 0.0`)** to HuggingFace's implementation.
 
 ### 4.2 Rotary Position Embeddings (RoPE)
-Instead of adding absolute positional embeddings to token embeddings, [`RotaryEmbedding`](model.py) encodes relative token distance by rotating pairs of query and key dimensions $(x_{i}, x_{i + d/2})$ in the 2D complex plane by an angle $m \theta_i$, where $m$ is the token's sequence position and $\theta_i = \text{base}^{-2i/d}$:
+Instead of adding absolute positional embeddings to token embeddings, [`RotaryEmbedding`](model.py) encodes relative token distance by rotating pairs of query and key dimensions $(x_{i})$ and $(x_{i + d/2})$ in the 2D complex plane by an angle $m \theta_i$, where $m$ is the token's sequence position and $\theta_i = \text{base}^{-2i/d}$:
 $$\begin{pmatrix} q'_{i} \\ q'_{i + d/2} \end{pmatrix} = \begin{pmatrix} \cos(m\theta_i) & -\sin(m\theta_i) \\ \sin(m\theta_i) & \cos(m\theta_i) \end{pmatrix} \begin{pmatrix} q_{i} \\ q_{i + d/2} \end{pmatrix}$$
-Because the dot product $(R_m q)^\top (R_n k) = q^\top R_{n-m} k$ depends only on the relative distance $m - n$, RoPE naturally generalizes to arbitrary positions and allows **Prefix Caching (Phase 5)** to reuse cached Key vectors without any positional modification!
+Because the dot product between rotated vectors $(R_m q)^\top$ and $(R_n k)$ equals $q^\top R_{n-m} k$ (which depends only on the relative distance $m - n$), RoPE naturally generalizes to arbitrary positions and allows **Prefix Caching (Phase 5)** to reuse cached Key vectors without any positional modification!
 
 ### 4.3 Grouped-Query Attention (GQA) & SwiGLU MLP
 * **Grouped-Query Attention (GQA):** In `Qwen2.5-0.5B`, there are $H_q = 14$ Query heads but only $H_{kv} = 2$ Key/Value heads (`num_kv_groups = 7`). Every group of 7 Query heads shares 1 Key head and 1 Value head. This shrinks the KV cache footprint in VRAM by **$7\times$** compared to standard Multi-Head Attention!
@@ -122,12 +122,12 @@ In Phase 1, [`ContiguousKVCache`](model.py) allocates a single static tensor upf
 ```python
 # Shape: [num_layers, batch_size, num_kv_heads, max_seq_len, head_dim]
 ```
-For `Qwen2.5-0.5B` ($L=24, H_{kv}=2, D=64$, `float16` = 2 bytes):
+For `Qwen2.5-0.5B` ($L=24$, $H_{kv}=2$, $D=64$, `float16` = 2 bytes):
 * Each token's KV cache across all 24 layers costs:
   $$2 \text{ (K and V)} \times 24 \times 2 \times 64 \times 2\text{ bytes} = 12,288\text{ bytes} = 12\text{ KB/token}$$
 * If we pre-allocate `batch_size = 8` with `max_seq_len = 2048` upfront (as demonstrated in `test_phase1.py`), we immediately lock up:
   $$8 \times 2048 \times 12\text{ KB} = \mathbf{192\text{ MB of VRAM}}$$
-  even when the prompt is only 10 tokens long (**99.5% internal fragmentation**)! Worse, for a 7B model ($L=32, H_{kv}=8, D=128$), a single 2048-token slot costs **256 MB**, and `batch_size = 8` would require **2 GB** of contiguous VRAM before generating a single token.
+  even when the prompt is only 10 tokens long (**99.5% internal fragmentation**)! Worse, for a 7B model ($L=32$, $H_{kv}=8$, $D=128$), a single 2048-token slot costs **256 MB**, and `batch_size = 8` would require **2 GB** of contiguous VRAM before generating a single token.
 
 ---
 
@@ -145,22 +145,22 @@ Just as an OS divides physical RAM into 4 KB page frames and gives each process 
 ```mermaid
 flowchart LR
     subgraph Logical["Sequence 101 Logical View (33 Tokens)"]
-        L0["Logical Block L0\n(Tokens 0..15)"]
-        L1["Logical Block L1\n(Tokens 16..31)"]
-        L2["Logical Block L2\n(Token 32)"]
+        L0["Logical Block L0 (Tokens 0..15)"]
+        L1["Logical Block L1 (Tokens 16..31)"]
+        L2["Logical Block L2 (Token 32)"]
     end
 
-    subgraph PT["Page Table (seq_id=101)"]
+    subgraph PT["Page Table (seq_id = 101)"]
         M0["page_table[0] = 0"]
         M1["page_table[1] = 1"]
         M2["page_table[2] = 9"]
     end
 
     subgraph Physical["Physical GPU KV Block Pool (Non-Contiguous)"]
-        P0["Physical Block P0\n(16/16 Full)"]
-        P1["Physical Block P1\n(16/16 Full)"]
-        P2_8["Physical Blocks P2..P8\n(Used by Seq 102 & 103)"]
-        P9["Physical Block P9\n(1/16 Used)"]
+        P0["Physical Block P0 (16/16 Full)"]
+        P1["Physical Block P1 (16/16 Full)"]
+        P2_8["Physical Blocks P2..P8 (Used by Seq 102 and 103)"]
+        P9["Physical Block P9 (1/16 Used)"]
     end
 
     L0 --> M0 --> P0
@@ -171,13 +171,13 @@ flowchart LR
 ### 5.2 Mathematical Address Translation (`resolve_logical_token`)
 When a sequence wants to read or write token at `logical_token_idx` (e.g., token `34` in `Seq 103` whose page table is `[P6, P7, P8]`), [`BlockSpaceManager.resolve_logical_token`](block_manager.py) translates the virtual index into a physical VRAM slot in $O(1)$ arithmetic:
 
-$$\text{logical\_block\_idx} = \lfloor 34 / 16 \rfloor = 2$$
+$$\text{logical-block-idx} = \lfloor 34 / 16 \rfloor = 2$$
 
-$$\text{block\_offset} = 34 \bmod 16 = 2$$
+$$\text{block-offset} = 34 \bmod 16 = 2$$
 
-$$\text{physical\_block\_id} = \text{page\_tables}[103][2] = 8$$
+$$\text{physical-block-id} = \text{page-tables}[103][2] = 8$$
 
-$$\text{global\_physical\_slot} = 8 \times 16 + 2 = 130$$
+$$\text{global-physical-slot} = 8 \times 16 + 2 = 130$$
 
 ### 5.3 Lifecycle of a Sequence's Blocks
 1. **Prefill Allocation (`allocate`):** A 20-token prompt needs $\lceil 20 / 16 \rceil = 2$ physical blocks (`P0` gets 16 tokens; `P1` gets 4 tokens and has 12 free slots left).
@@ -203,23 +203,23 @@ In **Phase 3** ([scheduler.py](scheduler.py)), [`ContinuousBatchScheduler`](sche
 sequenceDiagram
     participant W as Waiting Queue
     participant S as ContinuousBatchScheduler
-    participant R as Running Batch (Max=2)
+    participant R as Running Batch
     participant BM as BlockSpaceManager
 
-    Note over W,BM: Step 1: Seq 1 (10 tok), Seq 2 (150 tok), Seq 3 (50 tok) queued
-    W->>S: Pull Seq 1 & Seq 2 (PREFILL ADMIT)
+    Note over W,BM: Step 1 - Seq 1 (10 tok), Seq 2 (150 tok), Seq 3 (50 tok) queued
+    W->>S: Pull Seq 1 and Seq 2 (PREFILL ADMIT)
     S->>BM: Allocate P0 for Seq 1, P1 for Seq 2
-    S->>R: Running = [Seq 1, Seq 2] | Waiting = [Seq 3]
+    S->>R: Running is [Seq 1, Seq 2] and Waiting is [Seq 3]
 
-    Note over R,BM: Steps 2..9: Decode 1 token/step; Seq 2 grows into P2
-    Note over R,BM: Step 10: Seq 1 hits 10th token (EOS_TOKEN)!
-    R->>S: Immediately Evict Seq 1 -> FINISHED
-    S->>BM: Free Seq 1's physical block [P0]
+    Note over R,BM: Steps 2 to 9 - Decode 1 token/step and Seq 2 grows into P2
+    Note over R,BM: Step 10 - Seq 1 hits 10th token (EOS)
+    R->>S: Immediately Evict Seq 1 to FINISHED
+    S->>BM: Free Seq 1 physical block P0
 
-    Note over W,BM: Step 11: Slot opened! Admit Seq 3 mid-flight!
+    Note over W,BM: Step 11 - Slot opened, admit Seq 3 mid-flight
     W->>S: Pull Seq 3 (PREFILL ADMIT) while Seq 2 is at 10/150 tokens
     S->>BM: Allocate P3 for Seq 3
-    S->>R: Running = [Seq 2 (Decode), Seq 3 (Prefill->Decode)]
+    S->>R: Running is [Seq 2 (Decode), Seq 3 (Prefill to Decode)]
 ```
 
 ### 6.2 Two-Stage Execution: Prefill vs. Decode
@@ -327,7 +327,7 @@ $$\ell_{\text{new}} = \ell_{\text{old}} \cdot \alpha + \sum_{j \in B_i} p_j$$
 
 $$a_{\text{new}} = a_{\text{old}} \cdot \alpha + \sum_{j \in B_i} p_j v_j$$
 
-When a new block contains a larger logit ($m_{\text{new}} > m_{\text{old}}$), multiplying the previous accumulator $a_{\text{old}}$ by $\alpha = e^{m_{\text{old}} - m_{\text{new}}}$ rescales all past contributions in registers instantaneously! At the end of the loop, a single division `out = a / l` produces the exact softmax attention output in **one single pass** over the physical KV blocks.
+When a new block contains a larger logit ($m_{\text{new}}$ > $m_{\text{old}}$), multiplying the previous accumulator $a_{\text{old}}$ by $\alpha = \exp(m_{\text{old}} - m_{\text{new}})$ rescales all past contributions in registers instantaneously! At the end of the loop, a single division `out = a / l` produces the exact softmax attention output in **one single pass** over the physical KV blocks.
 
 ### 7.5 Tuning Triton Kernels for Turing `sm_75` vs. Ampere `sm_80`
 Why does our kernel compile and run cleanly on a GTX 1650 (`sm_75`) where many open-source FlashAttention/PagedAttention kernels fail?
@@ -358,24 +358,24 @@ $$H_k = \text{xxh64}\big(\text{parent}=H_{k-1} \,\|\, \text{tokens}[16k..16k+15]
 
 ```mermaid
 flowchart TD
-    subgraph Req1["Request 1 (Cold Cache): 153-Token System Prompt + Question 1"]
-        R1_B0["Logical Block L0 (tok 0..15)\nxxh64(0, tok[0..15]) = 0xbb3382...\nAllocated Physical Block P0 (ref=1)"]
-        R1_B1["Logical Block L1 (tok 16..31)\nxxh64(H0, tok[16..31]) = 0x562849...\nAllocated Physical Block P1 (ref=1)"]
-        R1_B8["...\nLogical Block L8 (tok 128..143)\nxxh64(H7, tok[128..143]) = 0x91a4f0...\nAllocated Physical Block P8 (ref=1)"]
-        R1_Tail["Suffix Tokens (tok 144..170)\nAllocated Physical Blocks P9, P10 (ref=1)"]
-        R1_B0 --> R1_B1 --> R1_B8 --> R1_Tail
+    subgraph Req1["Request 1 (Cold Cache) - 199-Token System Prompt + Question 1"]
+        R1_B0["Logical Block L0 (tok 0..15) | xxh64(0, tok) = 0x6f6cdf... | Physical Block P0 (ref=1)"]
+        R1_B1["Logical Block L1 (tok 16..31) | xxh64(H0, tok) = 0x3f7af7... | Physical Block P1 (ref=1)"]
+        R1_B11["Logical Blocks L2..L11 (tok 32..191) | Chained xxh64 | Physical Blocks P2..P11 (ref=1)"]
+        R1_Tail["Suffix Tokens (tok 192..213) | Allocated Physical Blocks P12, P13 (ref=1)"]
+        R1_B0 --> R1_B1 --> R1_B11 --> R1_Tail
     end
 
-    subgraph Req2["Request 2 (Warm Cache): Identical System Prompt + Question 2"]
-        R2_Hit["Logical Blocks L0..L8 (144 Tokens = 9 Full Blocks)\nALL 9 HASHES HIT hash_to_block_id!\nPage Table points directly to [P0..P8] (ref_count -> 2)\n0 Prefill Compute for these 144 tokens!"]
-        R2_Tail["Suffix Tokens (tok 144..173)\nAllocated New Physical Blocks P12, P13\nModel runs Prefill ONLY on these 30 suffix tokens!"]
+    subgraph Req2["Request 2 (Warm Cache) - Identical System Prompt + Question 2"]
+        R2_Hit["Logical Blocks L0..L11 (192 Tokens = 12 Full Blocks) | ALL 12 HASHES HIT! | Page Table -> [P0..P11] (ref=2, 0 Prefill Compute)"]
+        R2_Tail["Suffix Tokens (tok 192..224) | New Physical Blocks P16, P17, P18 | Prefill runs ONLY on these 33 suffix tokens"]
         R2_Hit --> R2_Tail
     end
 ```
 
 #### Zero-Copy Sharing & Partial Suffix Prefill
 When Request 2 arrives with the same 153-token system prompt (`9` full 16-token blocks = `144` tokens):
-1. `allocate_with_prefix_cache` computes $H_0, H_1, \dots, H_8$ in microseconds using `xxhash`.
+1. `allocate_with_prefix_cache` computes $H_0$, $H_1$, $\dots$, $H_8$ in microseconds using `xxhash`.
 2. Every hash hits `self.hash_to_block_id`!
 3. Request 2's page table entries `L0..L8` are pointed directly to Request 1's physical blocks `[P0, P1, P2, P3, P4, P5, P6, P7, P8]` and their `ref_count` is incremented to `2`.
 4. Only Request 2's unique suffix (`30` tokens) gets new physical blocks (`P12, P13`).
