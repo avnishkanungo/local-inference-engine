@@ -34,6 +34,7 @@ This document serves both as the **Project Guide** and a **Deep-Dive Textbook on
    * [Task 1: Automatic Prefix Caching (APC) with Chained `xxhash64`](#81-task-1-automatic-prefix-caching-apc-with-chained-xxhash64)
    * [Task 2: CUDA Graph Capture & Replay for Zero-Overhead Decoding](#82-task-2-cuda-graph-capture--replay-for-zero-overhead-decoding)
 9. [Architectural Comparison: Local-vLLM vs. Production vLLM vs. SGLang](#9-architectural-comparison-local-vllm-vs-production-vllm-vs-sglang)
+10. [Hardware Portability & Running on Other GPUs](#10-hardware-portability--running-on-other-gpus)
 
 ---
 
@@ -47,6 +48,8 @@ This document serves both as the **Project Guide** and a **Deep-Dive Textbook on
 | **Phase 3: Continuous Batching Scheduler** | [scheduler.py](scheduler.py) | [test_phase3.py](test_phase3.py) | `uv run test_phase3.py` |
 | **Phase 4: Triton PagedAttention Kernels** | [paged_attention.py](paged_attention.py) | [test_phase4.py](test_phase4.py), [benchmark_decoding.py](benchmark_decoding.py) | `uv run test_phase4.py`<br>`uv run benchmark_decoding.py` |
 | **Phase 5: Prefix Caching & CUDA Graphs** | [engine.py](engine.py), [block_manager.py](block_manager.py) | [test_phase5.py](test_phase5.py) | `uv run test_phase5.py` |
+
+> **Note for Other GPUs:** All steps **other than `verify_env.py`** (Phases 1–5 and `benchmark_decoding.py`) work out-of-the-box on **any newer NVIDIA GPU** (Compute Capability $\ge 7.0$, e.g., RTX 20xx/30xx/40xx/50xx, T4, L4, V100, A100, H100). See [Section 10](#10-hardware-portability--running-on-other-gpus) for full details.
 
 ---
 
@@ -428,3 +431,31 @@ Now that you understand every module in this repository, here is how our code ma
 * **Radix Tree (SGLang RadixAttention):**
   * Organizes all active and historical token sequences into a prefix tree (Radix Trie) where nodes split dynamically at the exact token where two prompts diverge.
   * Can match prefixes at single-token granularity (`page_size=1`) and enables tree-structured multi-branch generation (e.g., branching multiple Chain-of-Thought completions or JSON-schema branches from a single prompt node).
+
+---
+
+## 10. Hardware Portability & Running on Other GPUs
+
+Although this engine was carefully engineered to respect the tight constraints of a **GTX 1650 (`sm_75`, 4 GB VRAM, 64 KB SRAM/SM)**, **running all steps other than the Step 0 verification script (`verify_env.py`) will work out-of-the-box on any newer NVIDIA GPU** (Volta `sm_70` and above).
+
+Because the Triton kernels avoid Ampere-only (`sm_80+`) instructions and stay within Turing's 64 KB shared memory budget, they are **forward-compatible**—Triton automatically JIT-compiles them at runtime to the exact PTX/SASS architecture of whatever NVIDIA GPU you run on.
+
+### Compatibility Matrix
+
+| Hardware / GPU | Phases 1–3 (PyTorch) | Phases 4–5 (Triton + CUDA Graphs) | Notes |
+| :--- | :---: | :---: | :--- |
+| **NVIDIA Turing (`sm_75`)** *(GTX 1650, T4, RTX 20xx)* | Works | Works | Target hardware; [verify_env.py](verify_env.py) also passes. |
+| **Newer NVIDIA GPUs (`sm_80`–`sm_120`)** *(RTX 30xx/40xx/50xx, L4, A100, H100, B200)* | Works | Works | All Phases 1–5 and benchmarks run out-of-the-box via Triton runtime JIT. Only [verify_env.py](verify_env.py) fails its strict `assert (major, minor) == (7, 5)` check. |
+| **NVIDIA Volta (`sm_70`)** *(V100)* | Works | Works | Supported by Triton and native `float16`. Skip `verify_env.py`. |
+| **Older NVIDIA Pascal (`sm_60`/`sm_61`)** *(GTX 1060/1080)* | Works | No | OpenAI Triton requires Compute Capability $\ge 7.0$; Phase 4–5 Triton kernels will not compile. |
+| **AMD GPUs (ROCm on Linux)** | Needs ROCm wheels | Partial | PyTorch exposes ROCm via `torch.cuda` and Triton includes an AMD backend, but requires ROCm-specific PyTorch/Triton wheels. |
+| **Apple Silicon (MPS) / CPU-Only** | Needs device change | No | Triton kernels and `torch.cuda.CUDAGraph` require a CUDA GPU. |
+
+### Practical Notes When Moving to Another Machine
+1. **Why Only `verify_env.py` Is Hardware-Locked:**
+   * [verify_env.py](verify_env.py) explicitly checks `assert (major, minor) == (7, 5)` per Step 0 of the build plan. None of the engine modules ([model.py](model.py), [block_manager.py](block_manager.py), [scheduler.py](scheduler.py), [paged_attention.py](paged_attention.py), [engine.py](engine.py)) hardcode `sm_75`.
+2. **OS & Compiler Requirements:**
+   * OpenAI Triton requires **Linux** (or Windows via **WSL2**) with `gcc` installed to build its runtime CUDA driver wrapper. Using `uv` with managed Python automatically provides `Python.h`.
+3. **Scaling Up on Larger GPUs (RTX 3090 / 4090 / A100 / H100):**
+   * You can immediately test larger models via `--model` (e.g., `uv run test_phase4.py --model TinyLlama/TinyLlama-1.1B-Chat-v1.0` or `Qwen/Qwen2.5-3B`)—our Triton kernels already support `head_dim` of `32`, `64`, or `128`.
+   * On GPUs with more VRAM and larger SM shared memory (`sm_80+`), you can also raise `num_blocks` and `max_batch_size`, switch from `float16` to `bfloat16`, and increase `num_warps` in [paged_attention.py](paged_attention.py) for even higher throughput.
